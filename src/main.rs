@@ -41,64 +41,52 @@ impl FileNode {
     }
 }
 
-fn scan_directory(path: &Path, max_depth: usize) -> Option<FileNode> {
-    let mut root = FileNode::new(
-        path.file_name()?.to_string_lossy().to_string(),
-        path.to_path_buf(),
-        true,
-    );
+fn scan_directory_recursive(path: &Path) -> Option<FileNode> {
+    let metadata = std::fs::metadata(path).ok()?;
 
-    let mut entries: Vec<(PathBuf, u64, bool)> = Vec::new();
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
 
-    for entry in WalkDir::new(path)
-        .max_depth(max_depth)
-        .follow_links(false)
-    {
-        if let Ok(entry) = entry {
-            let metadata = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
+    let mut node = FileNode::new(name, path.to_path_buf(), metadata.is_dir());
 
-            let size = if metadata.is_file() {
-                metadata.len()
-            } else {
-                0
-            };
-
-            entries.push((
-                entry.path().to_path_buf(),
-                size,
-                metadata.is_dir(),
-            ));
-        }
+    if metadata.is_file() {
+        node.size = metadata.len();
+        return Some(node);
     }
 
-    // Build tree structure
-    for (entry_path, size, is_dir) in entries {
-        if entry_path == path {
-            continue;
-        }
+    // If it's a directory, scan all children recursively
+    if metadata.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries {
+                if let Ok(entry) = entry {
+                    let child_path = entry.path();
+                    // Skip special directories to avoid infinite loops
+                    if let Some(name) = child_path.file_name() {
+                        let name_str = name.to_string_lossy();
+                        if name_str == "." || name_str == ".." {
+                            continue;
+                        }
+                    }
 
-        if let Ok(relative) = entry_path.strip_prefix(path) {
-            let components: Vec<_> = relative.components().collect();
-            if components.len() == 1 {
-                let name = entry_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                let mut node = FileNode::new(name, entry_path, is_dir);
-                node.size = size;
-                root.children.push(node);
+                    if let Some(child_node) = scan_directory_recursive(&child_path) {
+                        node.children.push(child_node);
+                    }
+                }
             }
         }
+
+        // Sort children by size (largest first)
+        node.children.sort_by(|a, b| b.total_size().cmp(&a.total_size()));
     }
 
-    // Sort by size
-    root.children.sort_by(|a, b| b.total_size().cmp(&a.total_size()));
+    Some(node)
+}
 
-    Some(root)
+fn scan_directory(path: &Path, _max_depth: usize) -> Option<FileNode> {
+    scan_directory_recursive(path)
 }
 
 fn calculate_treemap(node: &FileNode, rect: Rect, min_area: f32) -> Vec<(Rect, FileNode)> {
@@ -202,8 +190,9 @@ struct DiskAnalyzerApp {
     root_node: Arc<Mutex<Option<FileNode>>>,
     current_path: String,
     scanning: bool,
-    depth: usize,
     selected_node: Option<FileNode>,
+    current_view_node: Option<FileNode>,
+    navigation_stack: Vec<FileNode>,
 }
 
 impl Default for DiskAnalyzerApp {
@@ -212,8 +201,9 @@ impl Default for DiskAnalyzerApp {
             root_node: Arc::new(Mutex::new(None)),
             current_path: std::env::var("HOME").unwrap_or_else(|_| "/".to_string()),
             scanning: false,
-            depth: 2,
             selected_node: None,
+            current_view_node: None,
+            navigation_stack: Vec::new(),
         }
     }
 }
@@ -225,18 +215,16 @@ impl eframe::App for DiskAnalyzerApp {
                 ui.label("Cesta:");
                 ui.text_edit_singleline(&mut self.current_path);
 
-                ui.label("Hĺbka:");
-                ui.add(egui::Slider::new(&mut self.depth, 1..=5));
-
                 if ui.button("📂 Skenovať").clicked() && !self.scanning {
                     let path = PathBuf::from(self.current_path.clone());
                     let root_node = self.root_node.clone();
-                    let depth = self.depth;
                     self.scanning = true;
                     self.selected_node = None;
+                    self.current_view_node = None;
+                    self.navigation_stack.clear();
 
                     thread::spawn(move || {
-                        if let Some(node) = scan_directory(&path, depth) {
+                        if let Some(node) = scan_directory(&path, 0) {
                             *root_node.lock().unwrap() = Some(node);
                         }
                     });
@@ -246,27 +234,62 @@ impl eframe::App for DiskAnalyzerApp {
                     ui.spinner();
                     ui.label("Skenujem...");
                 }
+
+                ui.separator();
+
+                // Navigation buttons
+                if !self.navigation_stack.is_empty() {
+                    if ui.button("⬅ Späť").clicked() {
+                        if let Some(previous) = self.navigation_stack.pop() {
+                            self.current_view_node = Some(previous);
+                        }
+                    }
+                }
+
+                if ui.button("🏠 Koreň").clicked() {
+                    self.current_view_node = None;
+                    self.navigation_stack.clear();
+                }
             });
         });
 
         egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
-            if let Some(node) = &self.selected_node {
-                ui.horizontal(|ui| {
-                    ui.label(format!("📄 {}", node.name));
+            ui.horizontal(|ui| {
+                // Show current directory
+                if let Some(view_node) = &self.current_view_node {
+                    ui.label(format!("📁 {}", view_node.path.display()));
                     ui.separator();
-                    ui.label(format!("Veľkosť: {}", format_size(node.total_size())));
+                    ui.label(format!("Celková veľkosť: {}", format_size(view_node.total_size())));
+                } else if let Some(root) = &*self.root_node.lock().unwrap() {
+                    ui.label(format!("📁 {}", root.path.display()));
                     ui.separator();
-                    ui.label(format!("Cesta: {}", node.path.display()));
-                });
-            } else {
-                ui.label("Kliknite na blok pre zobrazenie detailov");
-            }
+                    ui.label(format!("Celková veľkosť: {}", format_size(root.total_size())));
+                }
+
+                // Show selected item
+                if let Some(node) = &self.selected_node {
+                    ui.separator();
+                    ui.label("|");
+                    ui.separator();
+                    ui.label(format!("Vybrané: {} ({})", node.name, format_size(node.total_size())));
+                    if node.is_dir {
+                        ui.label("| Dvojklik pre vstup");
+                    }
+                }
+            });
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let node_lock = self.root_node.lock().unwrap();
 
-            if let Some(ref root) = *node_lock {
+            // Determine which node to display
+            let display_node = if let Some(ref view_node) = self.current_view_node {
+                Some(view_node.clone())
+            } else {
+                node_lock.clone()
+            };
+
+            if let Some(ref current) = display_node {
                 if self.scanning {
                     self.scanning = false;
                 }
@@ -279,10 +302,13 @@ impl eframe::App for DiskAnalyzerApp {
                     height: available_size.y,
                 };
 
-                let treemap = calculate_treemap(root, rect, 100.0);
-                let total_size = root.total_size();
+                let treemap = calculate_treemap(current, rect, 100.0);
+                let total_size = current.total_size();
 
-                let (response, painter) = ui.allocate_painter(available_size, egui::Sense::click());
+                let (response, painter) = ui.allocate_painter(
+                    available_size,
+                    egui::Sense::click()
+                );
 
                 for (i, (rect, node)) in treemap.iter().enumerate() {
                     let size_ratio = node.total_size() as f32 / total_size as f32;
@@ -309,9 +335,17 @@ impl eframe::App for DiskAnalyzerApp {
                     }
 
                     // Handle clicks
-                    if response.clicked() {
-                        if let Some(pointer_pos) = response.interact_pointer_pos() {
-                            if egui_rect.contains(pointer_pos) {
+                    if let Some(pointer_pos) = response.interact_pointer_pos() {
+                        if egui_rect.contains(pointer_pos) {
+                            if response.double_clicked() && node.is_dir {
+                                // Double-click: navigate into directory
+                                if let Some(ref current_display) = display_node {
+                                    self.navigation_stack.push(current_display.clone());
+                                }
+                                self.current_view_node = Some(node.clone());
+                                self.selected_node = None;
+                            } else if response.clicked() {
+                                // Single click: select
                                 self.selected_node = Some(node.clone());
                             }
                         }
