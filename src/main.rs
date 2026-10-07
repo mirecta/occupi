@@ -3,7 +3,6 @@ use std::f32::consts::PI;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use walkdir::WalkDir;
 
 #[derive(Clone, Debug)]
 struct FileNode {
@@ -52,23 +51,26 @@ impl FileNode {
 
 fn calculate_dir_size(path: &Path) -> u64 {
     let mut total = 0;
-    for entry in WalkDir::new(path).follow_links(false).max_depth(20) {
-        if let Ok(entry) = entry {
-            if let Ok(metadata) = entry.metadata() {
-                if metadata.is_file() {
-                    total += metadata.len();
+    
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries {
+            if let Ok(entry) = entry {
+                let entry_path = entry.path();
+                if let Ok(metadata) = std::fs::metadata(&entry_path) {
+                    if metadata.is_file() {
+                        total += metadata.len();
+                    } else if metadata.is_dir() {
+                        total += calculate_dir_size(&entry_path);
+                    }
                 }
             }
         }
     }
+    
     total
 }
 
-fn scan_directory_level(path: &Path, depth: usize) -> Option<FileNode> {
-    if depth > 2 {
-        return None;
-    }
-    
+fn scan_directory(path: &Path, _max_depth: usize) -> Option<FileNode> {
     let metadata = std::fs::metadata(path).ok()?;
     
     let name = path
@@ -77,13 +79,14 @@ fn scan_directory_level(path: &Path, depth: usize) -> Option<FileNode> {
         .to_string_lossy()
         .to_string();
     
-    let mut node = FileNode::new(name, path.to_path_buf(), metadata.is_dir());
+    let mut root = FileNode::new(name, path.to_path_buf(), metadata.is_dir());
     
     if !metadata.is_dir() {
-        node.size = metadata.len();
-        return Some(node);
+        root.size = metadata.len();
+        return Some(root);
     }
     
+    // Scan only first level children
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries {
             if let Ok(entry) = entry {
@@ -95,34 +98,27 @@ fn scan_directory_level(path: &Path, depth: usize) -> Option<FileNode> {
                     .to_string();
                 
                 if let Ok(child_metadata) = std::fs::metadata(&child_path) {
+                    let mut child_node = FileNode::new(
+                        child_name,
+                        child_path.clone(),
+                        child_metadata.is_dir(),
+                    );
+                    
                     if child_metadata.is_file() {
-                        let mut child_node = FileNode::new(
-                            child_name,
-                            child_path,
-                            false,
-                        );
                         child_node.size = child_metadata.len();
-                        node.children.push(child_node);
                     } else if child_metadata.is_dir() {
-                        if let Some(mut subnode) = scan_directory_level(&child_path, depth + 1) {
-                            if subnode.children.is_empty() {
-                                subnode.size = calculate_dir_size(&child_path);
-                            }
-                            node.children.push(subnode);
-                        }
+                        child_node.size = calculate_dir_size(&child_path);
                     }
+                    
+                    root.children.push(child_node);
                 }
             }
         }
     }
     
-    node.children.sort_by(|a, b| b.total_size().cmp(&a.total_size()));
+    root.children.sort_by(|a, b| b.total_size().cmp(&a.total_size()));
     
-    Some(node)
-}
-
-fn scan_directory(path: &Path, _max_depth: usize) -> Option<FileNode> {
-    scan_directory_level(path, 0)
+    Some(root)
 }
 
 fn calculate_sunburst(node: &FileNode, max_radius: f32) -> Vec<Segment> {
@@ -311,11 +307,9 @@ fn draw_segment(
             center.x + mid_radius * mid_angle.cos(),
             center.y + mid_radius * mid_angle.sin(),
         );
-
-        // Use white text with black outline for better visibility
+        
         let font = egui::FontId::proportional(10.0);
-
-        // Draw text shadow/outline
+        
         for dx in [-1.0, 0.0, 1.0] {
             for dy in [-1.0, 0.0, 1.0] {
                 if dx != 0.0 || dy != 0.0 {
@@ -329,8 +323,7 @@ fn draw_segment(
                 }
             }
         }
-
-        // Draw main text
+        
         painter.text(
             text_pos,
             egui::Align2::CENTER_CENTER,
@@ -509,37 +502,32 @@ impl eframe::App for DiskAnalyzerApp {
                     }
                 }
                 
-                // Draw callouts on top
                 for callout in callouts {
-                    // Determine text alignment based on position
                     let dx = callout.line_end.x - center.x;
                     let align = if dx > 0.0 {
                         egui::Align2::LEFT_CENTER
                     } else {
                         egui::Align2::RIGHT_CENTER
                     };
-
-                    // Add small horizontal offset for better spacing
+                    
                     let text_offset = if dx > 0.0 { 5.0 } else { -5.0 };
                     let text_pos = egui::Pos2::new(
                         callout.line_end.x + text_offset,
                         callout.line_end.y,
                     );
-
-                    // Measure text size for background
+                    
                     let font = egui::FontId::proportional(9.5);
                     let galley = painter.layout_no_wrap(
                         callout.text.clone(),
                         font.clone(),
                         egui::Color32::WHITE,
                     );
-
+                    
                     let text_rect = align.anchor_rect(egui::Rect::from_min_size(
                         text_pos,
                         galley.size(),
                     ));
-
-                    // Draw background with padding
+                    
                     let padding = egui::vec2(4.0, 2.0);
                     let bg_rect = text_rect.expand2(padding);
                     painter.rect_filled(
@@ -552,14 +540,12 @@ impl eframe::App for DiskAnalyzerApp {
                         3.0,
                         egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
                     );
-
-                    // Draw line
+                    
                     painter.line_segment(
                         [callout.line_start, callout.line_end],
                         egui::Stroke::new(1.2, egui::Color32::from_gray(150)),
                     );
-
-                    // Draw text
+                    
                     painter.galley(text_rect.min, galley, egui::Color32::WHITE);
                 }
                 
