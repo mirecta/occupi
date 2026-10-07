@@ -311,13 +311,32 @@ fn draw_segment(
             center.x + mid_radius * mid_angle.cos(),
             center.y + mid_radius * mid_angle.sin(),
         );
-        
+
+        // Use white text with black outline for better visibility
+        let font = egui::FontId::proportional(10.0);
+
+        // Draw text shadow/outline
+        for dx in [-1.0, 0.0, 1.0] {
+            for dy in [-1.0, 0.0, 1.0] {
+                if dx != 0.0 || dy != 0.0 {
+                    painter.text(
+                        egui::Pos2::new(text_pos.x + dx, text_pos.y + dy),
+                        egui::Align2::CENTER_CENTER,
+                        &segment.node.name,
+                        font.clone(),
+                        egui::Color32::BLACK,
+                    );
+                }
+            }
+        }
+
+        // Draw main text
         painter.text(
             text_pos,
             egui::Align2::CENTER_CENTER,
             &segment.node.name,
-            egui::FontId::proportional(10.0),
-            egui::Color32::BLACK,
+            font,
+            egui::Color32::WHITE,
         );
         None
     } else if angle_diff > 2.0 && segment.depth == 0 {
@@ -492,18 +511,56 @@ impl eframe::App for DiskAnalyzerApp {
                 
                 // Draw callouts on top
                 for callout in callouts {
-                    painter.line_segment(
-                        [callout.line_start, callout.line_end],
-                        egui::Stroke::new(1.0, egui::Color32::from_gray(180)),
+                    // Determine text alignment based on position
+                    let dx = callout.line_end.x - center.x;
+                    let align = if dx > 0.0 {
+                        egui::Align2::LEFT_CENTER
+                    } else {
+                        egui::Align2::RIGHT_CENTER
+                    };
+
+                    // Add small horizontal offset for better spacing
+                    let text_offset = if dx > 0.0 { 5.0 } else { -5.0 };
+                    let text_pos = egui::Pos2::new(
+                        callout.line_end.x + text_offset,
+                        callout.line_end.y,
                     );
-                    
-                    painter.text(
-                        callout.line_end,
-                        egui::Align2::LEFT_CENTER,
-                        &callout.text,
-                        egui::FontId::proportional(9.0),
+
+                    // Measure text size for background
+                    let font = egui::FontId::proportional(9.5);
+                    let galley = painter.layout_no_wrap(
+                        callout.text.clone(),
+                        font.clone(),
                         egui::Color32::WHITE,
                     );
+
+                    let text_rect = align.anchor_rect(egui::Rect::from_min_size(
+                        text_pos,
+                        galley.size(),
+                    ));
+
+                    // Draw background with padding
+                    let padding = egui::vec2(4.0, 2.0);
+                    let bg_rect = text_rect.expand2(padding);
+                    painter.rect_filled(
+                        bg_rect,
+                        3.0,
+                        egui::Color32::from_rgba_premultiplied(30, 30, 30, 220),
+                    );
+                    painter.rect_stroke(
+                        bg_rect,
+                        3.0,
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+                    );
+
+                    // Draw line
+                    painter.line_segment(
+                        [callout.line_start, callout.line_end],
+                        egui::Stroke::new(1.2, egui::Color32::from_gray(150)),
+                    );
+
+                    // Draw text
+                    painter.galley(text_rect.min, galley, egui::Color32::WHITE);
                 }
                 
                 if let Some(hovered_idx) = self.hovered_segment {
